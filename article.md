@@ -283,7 +283,7 @@ Pat yourself on the back. You've just turned on the lights. Next time someone as
 
 ## Resources
 
-- GitHub Repository: [Notebook_Cost_Attribution](https://github.com/jordandhill/Notebook_Cost_Attribution)
+- GitHub Repository: [Notebook_Cost_Attribution_Workspaces](https://github.com/jordandhill/Notebook_Cost_Attribution_Workspaces)
 - Snowflake Docs: [Notebook Usage and Cost Monitoring](https://docs.snowflake.com/en/user-guide/ui-snowsight/notebooks-usage)
 - Snowflake Docs: [Notebooks on Container Runtime](https://docs.snowflake.com/en/developer-guide/snowflake-ml/notebooks-on-spcs)
 - Snowflake Docs: [NOTEBOOKS_CONTAINER_RUNTIME_HISTORY View](https://docs.snowflake.com/en/sql-reference/account-usage/notebooks_container_runtime_history)
