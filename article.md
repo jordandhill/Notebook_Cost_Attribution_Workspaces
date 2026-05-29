@@ -59,7 +59,7 @@ Before we dive in, a few things to know:
 
 **1. Fast Queries Are Not Cost-Attributed.** Queries executing in under ~100ms won't appear in `query_attribution_history`. These consume negligible resources — don't worry about them.
 
-**2. Idle Time Is Not Attributed.** Warehouse idle time between queries and compute pool idle time before auto-shutdown won't show up. Compute pools have a configurable `IDLE_AUTO_SHUTDOWN_TIME_SECONDS` (default: 1 hour, max: 72 hours).
+**2. Idle Time Is Not Attributed.** Warehouse idle time between queries and compute pool idle time before auto-shutdown won't show up. Notebooks have a configurable `IDLE_AUTO_SHUTDOWN_TIME_SECONDS` property (default: 30 minutes for Warehouse Runtime, 60 minutes for Container Runtime; max 72 hours for both).
 
 **3. Attribution Latency.** This isn't real-time:
 - `query_attribution_history`: up to 8 hours latency
@@ -145,7 +145,7 @@ ORDER BY total_warehouse_credits DESC;
 ```
 
 **How this works:**
-1. The first CTE identifies all notebooks by looking for `EXECUTE NOTEBOOK` queries and extracting `StreamlitName` from the query tag.
+1. The first CTE identifies all notebooks by looking for `EXECUTE NOTEBOOK` (Legacy) or `EXECUTE NOTEBOOK PROJECT` (Notebooks in Workspaces) queries and extracting `StreamlitName` from the query tag. The `ILIKE 'execute notebook%'` filter catches both.
 2. The second CTE finds all child queries containing that notebook name in their tags.
 3. The final query joins with `query_attribution_history` to get the actual credit costs.
 
