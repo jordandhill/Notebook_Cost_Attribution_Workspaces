@@ -1,55 +1,78 @@
-# Snowflake Notebook Cost Attribution
+# Snowflake Notebook Cost Attribution (Notebooks in Workspaces)
 
-Updated guide and tooling for tracking Snowflake Notebook costs across the **dual-cost model** introduced with Notebooks in Workspaces (the successor to Legacy Notebooks).
+> For the legacy version (Warehouse Runtime only), see [Notebook_Cost_Attribution](https://github.com/jordandhill/Notebook_Cost_Attribution).
 
-## What's New (2026 Edition)
+Guide and tooling for tracking Snowflake Notebook costs across the **dual-cost model** introduced with Notebooks in Workspaces.
 
-Snowflake Notebooks in Workspaces introduce a dual-cost model:
-1. **Container Runtime** (SPCS compute pool) — per-user Python kernel costs
-2. **Warehouse Pushdown** — SQL/Snowpark queries executed on the warehouse
+## The Dual-Cost Model
 
-This project provides SQL views, a Streamlit dashboard, and a Medium article draft covering both cost dimensions.
+Snowflake Notebooks in Workspaces introduce two billing dimensions:
+1. **Container Runtime** (SPCS compute pool) — per-user Python kernel costs, tracked via `notebooks_container_runtime_history`
+2. **Warehouse Pushdown** — SQL/Snowpark queries executed on the warehouse, tracked via `query_attribution_history`
 
 ## Project Structure
 
 ```
-├── article.md                        # Updated Medium article draft
-├── streamlit_app.py                  # Streamlit in Snowflake dashboard
+├── article.md                         # Medium article draft
+├── streamlit_app.py                   # Streamlit dashboard (Container Runtime compatible)
+├── requirements.txt                   # Python dependencies for container runtime
+├── cost_demo_notebook.ipynb           # Sample notebook for generating test spend
+├── ml_training_notebook.ipynb         # Sample ML notebook for generating test spend
 ├── sql/
-│   ├── 01_setup.sql                  # Database, schema, and tag creation
+│   ├── 01_setup.sql                   # Tags, compute pool, and Streamlit deployment
 │   ├── 02_container_runtime_costs.sql # Container Runtime cost queries
 │   ├── 03_warehouse_pushdown_costs.sql # Warehouse pushdown cost queries
 │   └── 04_combined_total_cost.sql     # Unified cost attribution query
-└── README.md                         # This file
+└── README.md
 ```
 
-## Snowflake Objects Created
+## Deploy the Streamlit Dashboard
 
-- **Database:** `NOTEBOOK_COST_ATTRIBUTION`
-- **Schema:** `NOTEBOOK_COST_ATTRIBUTION.ANALYTICS`
-- **Tags:** `COST_CENTER`, `TEAM`, `PROJECT`
-- **Views:**
-  - `V_NOTEBOOK_CONTAINER_RUNTIME_COSTS` — Container Runtime costs
-  - `V_NOTEBOOK_WAREHOUSE_PUSHDOWN_COSTS` — Warehouse pushdown costs
-  - `V_NOTEBOOK_TOTAL_COSTS` — Unified daily cost view
-  - `V_NOTEBOOK_COST_SUMMARY` — Leaderboard by notebook
-  - `V_NOTEBOOK_COST_BY_USER` — Attribution by user
+The dashboard runs on **Container Runtime** — a persistent shared server on SPCS.
 
-## Quick Start
+### Step 1: Upload files
 
-1. Run `sql/01_setup.sql` to create tags
-2. The views are already created in the account
-3. Deploy the Streamlit app or query the views directly
+```bash
+snow stage copy streamlit_app.py  @MY_DB.MY_SCHEMA.APP_STAGE --overwrite
+snow stage copy requirements.txt  @MY_DB.MY_SCHEMA.APP_STAGE --overwrite
+```
 
-## Deploy Streamlit Dashboard
+### Step 2: Create a compute pool (or use an existing one)
 
 ```sql
-CREATE STAGE IF NOT EXISTS NOTEBOOK_COST_ATTRIBUTION.ANALYTICS.APP_STAGE;
--- Upload streamlit_app.py to the stage
-PUT file://streamlit_app.py @NOTEBOOK_COST_ATTRIBUTION.ANALYTICS.APP_STAGE;
-
-CREATE STREAMLIT IF NOT EXISTS NOTEBOOK_COST_ATTRIBUTION.ANALYTICS.NOTEBOOK_COST_DASHBOARD
-    ROOT_LOCATION = '@NOTEBOOK_COST_ATTRIBUTION.ANALYTICS.APP_STAGE'
-    MAIN_FILE = 'streamlit_app.py'
-    QUERY_WAREHOUSE = 'COMPUTE_WH';
+CREATE COMPUTE POOL IF NOT EXISTS NOTEBOOK_COST_DASHBOARD_POOL
+    MIN_NODES = 1
+    MAX_NODES = 1
+    INSTANCE_FAMILY = CPU_X64_XS
+    AUTO_RESUME = TRUE
+    AUTO_SUSPEND_SECS = 3600;
 ```
+
+### Step 3: Deploy and activate
+
+```sql
+CREATE OR REPLACE STREAMLIT MY_DB.MY_SCHEMA.NOTEBOOK_COST_DASHBOARD
+    FROM '@MY_DB.MY_SCHEMA.APP_STAGE'
+    MAIN_FILE = 'streamlit_app.py'
+    RUNTIME_NAME = 'SYSTEM$ST_CONTAINER_RUNTIME_PY3_11'
+    COMPUTE_POOL = NOTEBOOK_COST_DASHBOARD_POOL
+    QUERY_WAREHOUSE = COMPUTE_WH
+    TITLE = 'Notebook Cost Attribution Dashboard';
+
+-- Required to activate after CREATE
+ALTER STREAMLIT MY_DB.MY_SCHEMA.NOTEBOOK_COST_DASHBOARD ADD LIVE VERSION FROM LAST;
+```
+
+See `sql/01_setup.sql` for the full setup script including tags and optional views.
+
+## Requirements
+
+Requires access to:
+- `snowflake.account_usage.query_history`
+- `snowflake.account_usage.query_attribution_history`
+- `snowflake.account_usage.notebooks_container_runtime_history`
+
+## Attribution Latency
+
+- `query_attribution_history`: up to 8 hours
+- `notebooks_container_runtime_history`: up to 3 hours

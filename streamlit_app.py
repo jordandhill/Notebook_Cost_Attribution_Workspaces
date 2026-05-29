@@ -5,8 +5,16 @@ import os
 st.set_page_config(page_title="Notebook Cost Attribution", layout="wide")
 
 try:
+    # Container runtime: use st.connection for thread-safety (shared multi-user server)
+    # Warehouse runtime: get_active_session() works fine
     from snowflake.snowpark.context import get_active_session
-    session = get_active_session()
+    import streamlit as _st_check
+    # Prefer st.connection when available (container runtime)
+    try:
+        _snowflake_conn = _st_check.connection("snowflake")
+        session = _snowflake_conn.session()
+    except Exception:
+        session = get_active_session()
     _use_snowpark = True
 except Exception:
     _use_snowpark = False

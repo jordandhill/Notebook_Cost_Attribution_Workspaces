@@ -1,10 +1,10 @@
 # A Practical Guide to Snowflake Notebook Cost Attribution
 
-No matter how mature your data platform is, someone on your team is going to ask the inevitable question: "How much are those notebooks costing us?" And honestly — with Snowflake Notebooks taking off the way they are right now — it's a great question.
+No matter how mature your data platform is, someone on your team is going to ask the inevitable question: "How much this costing us?".  Best to have a ready-made answer for when that question arises.  Today we are talking Snowflake Notebooks, new and improved that is.
 
-Snowflake has already renamed the original experience to "Legacy Notebooks" and announced a migration timeline to the new experience. The shift to file-based Workspaces has unlocked a lot of great capabilities — Jupyter compatibility, Git integration, proper file and folder organization, and a much more flexible development environment. Everyone's moving. But here's the thing — the cost model is a bit more nuanced than what you're used to.
+The shift to file-based Workspaces has unlocked a lot of great capabilities — Jupyter compatibility, Git integration, proper file and folder organization, and a much more flexible development environment. Everyone's moving. But here's the thing — the cost model is a bit more nuanced than what you're used to.
 
-**The problem:** Notebooks on Container Runtime have *two* billing dimensions. There's the container compute that runs your Python kernel — that's at the user level. And then there's the warehouse pushdown for your SQL and Snowpark queries. Without proper attribution, these costs become a black box.
+**The nuance:** Notebooks on Container Runtime have *two* billing dimensions. There's the container compute that runs your Python kernel — that's at the user level. And then there's the warehouse pushdown for your SQL and Snowpark queries. Without proper attribution, these costs become a black box.
 
 **The solution:** Snowflake gives you everything you need to track both. Let me show you how.
 
@@ -234,35 +234,43 @@ SQL queries are powerful, but they require manual execution and lack visual cont
 
 ### Quick Deployment
 
-The dashboard code is available at: [https://github.com/jordandhill/Notebook_Cost_Attribution](https://github.com/jordandhill/Notebook_Cost_Attribution)
+The dashboard code is available at: [https://github.com/jordandhill/Notebook_Cost_Attribution_Workspaces](https://github.com/jordandhill/Notebook_Cost_Attribution_Workspaces)
 
-Deploy to Snowflake in one statement:
+Upload the files and deploy on Container Runtime — all within Snowflake, no additional infrastructure required:
 
 ```sql
-CREATE STREAMLIT IF NOT EXISTS my_db.my_schema.notebook_cost_dashboard
-    ROOT_LOCATION = '@my_db.my_schema.my_stage'
+-- Create a stage and upload your files (Snow CLI)
+CREATE STAGE IF NOT EXISTS my_db.my_schema.app_stage DIRECTORY = (ENABLE = TRUE);
+-- snow stage copy streamlit_app.py  @my_db.my_schema.app_stage --overwrite
+-- snow stage copy requirements.txt  @my_db.my_schema.app_stage --overwrite
+
+-- (Optional) dedicated compute pool for the dashboard
+CREATE COMPUTE POOL IF NOT EXISTS NOTEBOOK_COST_DASHBOARD_POOL
+    MIN_NODES = 1
+    MAX_NODES = 1
+    INSTANCE_FAMILY = CPU_X64_XS
+    AUTO_RESUME = TRUE
+    AUTO_SUSPEND_SECS = 3600;
+
+-- Deploy on Container Runtime
+CREATE OR REPLACE STREAMLIT my_db.my_schema.notebook_cost_dashboard
+    FROM '@my_db.my_schema.app_stage'
     MAIN_FILE = 'streamlit_app.py'
-    QUERY_WAREHOUSE = 'COMPUTE_WH';
+    RUNTIME_NAME = 'SYSTEM$ST_CONTAINER_RUNTIME_PY3_11'
+    COMPUTE_POOL = NOTEBOOK_COST_DASHBOARD_POOL
+    QUERY_WAREHOUSE = COMPUTE_WH
+    TITLE = 'Notebook Cost Attribution Dashboard';
+
+-- Activate the app
+ALTER STREAMLIT my_db.my_schema.notebook_cost_dashboard ADD LIVE VERSION FROM LAST;
 ```
 
-That's it! The dashboard automatically refreshes based on your selected time range and gives you an intuitive interface for cost exploration. All within Snowflake. No additional infrastructure required.
+That's it! The dashboard runs as a persistent shared server on Container Runtime — viewers share one app instance instead of spinning up per-user warehouse sessions. All within Snowflake.
 
-## One More Thing: Legacy Notebooks → Notebooks in Workspaces
-
-If you're migrating from Legacy Notebooks — and you will be soon — here's the good news for cost tracking:
-
-| Aspect | Legacy Notebooks | Notebooks in Workspaces |
-|--------|-----------------|------------------------|
-| Container Runtime | `notebooks_container_runtime_history` | Same view — no change |
-| Warehouse queries | Query tag: `StreamlitName` | Same format — no change |
-| Scheduling | Task-based | Same mechanism |
-| New concern | N/A | Per-user compute pool nodes (multi-user = multi-node) |
-
-Your existing cost attribution queries continue to work seamlessly. The key new consideration is that Container Runtime costs scale per-user, making user-level attribution even more important than before.
 
 ## Conclusion
 
-Snowflake Notebook cost attribution goes from black box to crystal clear when you leverage:
+Snowflake Notebook cost attribution is crystal clear when you leverage:
 
 1. **`notebooks_container_runtime_history`** for per-user container compute
 2. **`query_attribution_history`** with notebook query tags for warehouse pushdown
@@ -271,7 +279,7 @@ Snowflake Notebook cost attribution goes from black box to crystal clear when yo
 
 Start with the combined SQL query in Step 3, explore your cost distribution, and when you're ready for continuous monitoring, deploy the dashboard. As the migration from Legacy Notebooks accelerates and teams lean further into Workspaces, having this visibility from day one is critical.
 
-Pat yourself on the back. You've just turned on the lights. 💥
+Pat yourself on the back. You've just turned on the lights. Next time someone asks "How much is this costing us?" You are ready  💥
 
 ## Resources
 
