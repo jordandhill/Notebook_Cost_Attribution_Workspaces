@@ -30,26 +30,42 @@ When you run a Notebook in Workspaces on Container Runtime, your costs split acr
 └────────────────────────┴────────────────────────────────┘
 ```
 
-**Container Runtime** is billed at the user level. Each user gets their own node on the compute pool, and the credit rate depends on the machine type (CPU vs GPU). This shows up in the `notebooks_container_runtime_history` view.
+**Container Runtime** is billed at the user level. Each user gets their own persistent service (named `<user>_SERVICE_N`) and node on the compute pool, and the credit rate depends on the machine type (CPU vs GPU). This shows up in the `notebooks_container_runtime_history` view. Note that for Workspaces notebooks, the `NOTEBOOK_NAME` column is **NULL** — because Workspaces notebooks are file-based rather than schema-level `NOTEBOOK` objects, container usage is tracked per **user and service**, not per notebook name.
 
-**Warehouse Pushdown** queries are billed against the warehouse configured for the notebook. Even on Container Runtime, SQL cells and Snowpark push-down operations execute on the warehouse for optimal performance. These show up in `query_attribution_history` with notebook query tags.
+**Warehouse Pushdown** queries are billed against the warehouse configured for the notebook. Even on Container Runtime, SQL cells and Snowpark push-down operations execute on the warehouse for optimal performance. These show up in `query_attribution_history`, which you can tie back to a notebook through the session client metadata (more on that next).
 
 Two cost dimensions. Two views. One unified picture. Let's build it.
 
-## Understanding Notebook Query Tags
+## Identifying Notebook Queries
 
-Every notebook execution creates queries tagged with JSON metadata that looks like this:
+Notebooks in Workspaces do **not** automatically emit query tags. Unlike some other Snowflake execution contexts (Cortex Code, Streamlit apps), queries run from a Workspaces notebook have an empty `QUERY_TAG` field. So how do you find them?
+
+The answer is the `SNOWFLAKE.ACCOUNT_USAGE.SESSIONS` view. Every session automatically records its originating client in the `CLIENT_ENVIRONMENT` column, and notebook kernels populate it with a telltale value:
 
 ```json
 {
-  "StreamlitEngine": "ExecuteStreamlit",
-  "StreamlitName": "MY_DATABASE.MY_SCHEMA.\"My Notebook\""
+  "APPLICATION": "Snowflake Web App (snowsight_notebook)",
+  ...
 }
 ```
 
-The `StreamlitName` field is your ticket — it contains the fully qualified notebook name (database.schema.notebook), which lets you trace all related queries back to their source.
+This is set automatically — no configuration required. It cleanly distinguishes notebook activity from other Snowsight surfaces:
 
-**Protip:** This tagging format is the same whether you're on Legacy Notebooks or Notebooks in Workspaces. Your existing attribution queries will continue to work as you migrate. No problem.
+| `CLIENT_ENVIRONMENT:APPLICATION` | `CLIENT_APPLICATION_ID` | Source |
+|---|---|---|
+| `snowsight_notebook` | `PythonSnowpark ...` | Workspaces notebook kernel |
+| `snowsight_notebook` | `Go ...` | Legacy notebook executor |
+| `snowsight_workspace_user_sql` | `Snowsight` | Workspaces SQL worksheet |
+| `snowsight_worksheet` | `Snowsight` | Legacy worksheet |
+| `cortex_code_desktop` | `JavaScript ...` | Cortex Code |
+
+Filtering on `APPLICATION = 'Snowflake Web App (snowsight_notebook)'` captures **both** Workspaces and legacy notebook sessions (the client differs — `PythonSnowpark` vs `Go` — but the application label is shared). From there, `SESSION_ID` bridges to `QUERY_HISTORY`, and `QUERY_ID` bridges to `QUERY_ATTRIBUTION_HISTORY` for the credits.
+
+**The one limitation:** this attributes by *user and session*, not by notebook *name* — `SESSIONS` doesn't know which notebook file the kernel opened. If a single user runs three notebooks, their sessions collapse together. For per-notebook-name granularity, set a manual query tag in the first cell (covered in Step 2 as an upgrade):
+
+```sql
+ALTER SESSION SET QUERY_TAG = '{"notebook": "my_analysis_notebook"}';
+```
 
 Checkout [Snowflake's documentation on notebook usage monitoring](https://docs.snowflake.com/en/user-guide/ui-snowsight/notebooks-usage) for the full picture of what data you have at your disposal.
 
@@ -61,20 +77,21 @@ Before we dive in, a few things to know:
 
 **2. Idle Time Is Not Attributed.** Warehouse idle time between queries and compute pool idle time before auto-shutdown won't show up. Notebooks have a configurable `IDLE_AUTO_SHUTDOWN_TIME_SECONDS` property (default: 30 minutes for Warehouse Runtime, 60 minutes for Container Runtime; max 72 hours for both).
 
-**3. Attribution Latency.** This isn't real-time:
-- `query_attribution_history`: up to 8 hours latency
+**3. Attribution Latency.** This isn't real-time, and your numbers are only as fresh as the slowest view in the chain:
+- `query_attribution_history`: up to 8 hours latency (the binding constraint)
 - `notebooks_container_runtime_history`: up to 3 hours latency
+- `sessions`: up to 3 hours latency
 
-**4. Container Runtime is Per-User.** Each compute pool node runs one notebook per user. Five users open the same notebook? That's five nodes. The `notebooks_container_runtime_history` view tracks this at the user level — which makes user-level attribution critical.
+**4. Container Runtime is Per-User.** Each user gets a persistent service (`<user>_SERVICE_N`) with its own node on the compute pool. The `notebooks_container_runtime_history` view tracks this at the user level — and since `notebook_name` is NULL for Workspaces notebooks, `user_name` is your attribution key on the container side.
 
 ## Step 1: Track Container Runtime Costs
 
-Query the `notebooks_container_runtime_history` view for the SPCS component:
+Query the `notebooks_container_runtime_history` view for the SPCS component. For Workspaces notebooks, group by `user_name` and `service_name` — `notebook_name` will be NULL:
 
 ```sql
 SELECT
-    notebook_name,
     user_name,
+    service_name,
     compute_pool_name,
     SUM(credits) AS total_container_credits,
     SUM(notebook_execution_time_secs) AS total_execution_seconds
@@ -89,7 +106,7 @@ And if you want to understand your GPU vs CPU cost distribution — especially u
 ```sql
 SELECT
     compute_pool_name,
-    COUNT(DISTINCT notebook_name) AS notebooks,
+    COUNT(DISTINCT service_name) AS services,
     COUNT(DISTINCT user_name) AS users,
     SUM(credits) AS total_credits,
     SUM(notebook_execution_time_secs) / 3600 AS total_hours
@@ -103,89 +120,95 @@ That's the container side. Now let's get the warehouse side.
 
 ## Step 2: Track Warehouse Pushdown Costs
 
-For the SQL and Snowpark queries that execute on the warehouse:
+For the SQL and Snowpark queries that execute on the warehouse, chain three views together: `SESSIONS` identifies the notebook sessions automatically, `QUERY_HISTORY` links sessions to their queries, and `QUERY_ATTRIBUTION_HISTORY` provides the attributed credits.
 
 ```sql
-WITH notebook_query_tags AS (
-    SELECT DISTINCT
-        PARSE_JSON(query_tag):StreamlitName::VARCHAR AS notebook_name
-    FROM snowflake.account_usage.query_history 
-    WHERE query_text ILIKE 'execute notebook%'
-      AND query_tag IS NOT NULL
-      AND start_time >= DATEADD(day, -30, CURRENT_TIMESTAMP())
-),
-all_nb_queries AS (
-    SELECT 
-        qt.notebook_name,
-        qh.query_id,
-        qh.user_name,
-        qh.warehouse_name,
-        qh.start_time,
-        qh.end_time,
-        qh.execution_time,
-        qh.query_type
-    FROM snowflake.account_usage.query_history qh
-    JOIN notebook_query_tags qt
-    WHERE qh.query_tag ILIKE ('%' || qt.notebook_name || '%')
-      AND qh.start_time >= DATEADD(day, -30, CURRENT_TIMESTAMP())
+WITH notebook_sessions AS (
+    SELECT DISTINCT session_id, user_name
+    FROM snowflake.account_usage.sessions
+    WHERE GET_PATH(PARSE_JSON(client_environment), 'APPLICATION')::VARCHAR
+          = 'Snowflake Web App (snowsight_notebook)'
+      AND created_on >= DATEADD(day, -30, CURRENT_TIMESTAMP())
 )
-SELECT 
-    notebook_name,
-    COUNT(*) AS total_queries,
+SELECT
+    ns.user_name,
+    COUNT(DISTINCT qh.query_id) AS attributed_queries,
     SUM(qah.credits_attributed_compute) AS total_warehouse_credits,
-    MIN(nb.start_time) AS first_execution,
-    MAX(nb.end_time) AS last_execution,
-    ARRAY_AGG(DISTINCT nb.warehouse_name) AS warehouses_used,
-    ARRAY_AGG(DISTINCT nb.user_name) AS users
-FROM all_nb_queries nb
-LEFT JOIN snowflake.account_usage.query_attribution_history qah 
-    ON nb.query_id = qah.query_id
-GROUP BY notebook_name
+    ARRAY_AGG(DISTINCT qah.warehouse_name) AS warehouses_used
+FROM notebook_sessions ns
+JOIN snowflake.account_usage.query_history qh
+    ON qh.session_id = ns.session_id
+    AND qh.start_time >= DATEADD(day, -30, CURRENT_TIMESTAMP())
+JOIN snowflake.account_usage.query_attribution_history qah
+    ON qh.query_id = qah.query_id
+GROUP BY ALL
 ORDER BY total_warehouse_credits DESC;
 ```
 
 **How this works:**
-1. The first CTE identifies all notebooks by looking for `EXECUTE NOTEBOOK` (Legacy) or `EXECUTE NOTEBOOK PROJECT` (Notebooks in Workspaces) queries and extracting `StreamlitName` from the query tag. The `ILIKE 'execute notebook%'` filter catches both.
-2. The second CTE finds all child queries containing that notebook name in their tags.
-3. The final query joins with `query_attribution_history` to get the actual credit costs.
+1. The CTE finds notebook sessions via the auto-populated `CLIENT_ENVIRONMENT:APPLICATION` value — no setup required.
+2. `SESSION_ID` joins those sessions to their queries in `query_history`.
+3. `QUERY_ID` joins to `query_attribution_history` for the actual attributed credits.
+
+This is fully automatic and captures both Workspaces and legacy notebooks. The inner join to `query_attribution_history` means only real compute queries (>~100ms) count — notebook control-plane and metadata calls contribute nothing, so there's no inflation.
+
+### Upgrade: per-notebook-name attribution
+
+The query above attributes by **user**, not by notebook name (the `SESSIONS` view doesn't track which notebook file is open). If you need to break costs down by individual notebook, set a query tag in the first cell:
+
+```sql
+ALTER SESSION SET QUERY_TAG = '{"notebook": "my_analysis_notebook"}';
+```
+
+Then `query_attribution_history` carries the tag directly — no session join needed:
+
+```sql
+SELECT 
+    PARSE_JSON(query_tag):notebook::VARCHAR AS notebook_name,
+    user_name,
+    warehouse_name,
+    COUNT(*) AS attributed_queries,
+    SUM(credits_attributed_compute) AS total_warehouse_credits
+FROM snowflake.account_usage.query_attribution_history
+WHERE query_tag ILIKE '%"notebook"%'
+  AND start_time >= DATEADD(day, -30, CURRENT_TIMESTAMP())
+GROUP BY ALL
+ORDER BY total_warehouse_credits DESC;
+```
 
 ## Step 3: Combine Both Dimensions
 
-Here's where it gets good. The real power comes from combining both cost components into a single unified view:
+Here's where it gets good. Both dimensions key on `user_name` — the container side is per-user, and the warehouse side comes from the automatic session-based attribution in Step 2:
 
 ```sql
 WITH container_costs AS (
     SELECT
-        notebook_name,
         user_name,
         SUM(credits) AS container_credits
     FROM snowflake.account_usage.notebooks_container_runtime_history
     WHERE start_time >= DATEADD(day, -30, CURRENT_TIMESTAMP())
     GROUP BY ALL
 ),
-notebook_query_tags AS (
-    SELECT DISTINCT
-        PARSE_JSON(query_tag):StreamlitName::VARCHAR AS notebook_name
-    FROM snowflake.account_usage.query_history 
-    WHERE query_text ILIKE 'execute notebook%'
-      AND query_tag IS NOT NULL
-      AND start_time >= DATEADD(day, -30, CURRENT_TIMESTAMP())
+notebook_sessions AS (
+    SELECT DISTINCT session_id, user_name
+    FROM snowflake.account_usage.sessions
+    WHERE GET_PATH(PARSE_JSON(client_environment), 'APPLICATION')::VARCHAR
+          = 'Snowflake Web App (snowsight_notebook)'
+      AND created_on >= DATEADD(day, -30, CURRENT_TIMESTAMP())
 ),
 warehouse_costs AS (
     SELECT 
-        qt.notebook_name,
-        qh.user_name,
+        ns.user_name,
         SUM(qah.credits_attributed_compute) AS warehouse_credits
-    FROM snowflake.account_usage.query_history qh
-    JOIN notebook_query_tags qt
-        ON qh.query_tag ILIKE ('%' || qt.notebook_name || '%')
-    LEFT JOIN snowflake.account_usage.query_attribution_history qah 
+    FROM notebook_sessions ns
+    JOIN snowflake.account_usage.query_history qh
+        ON qh.session_id = ns.session_id
+        AND qh.start_time >= DATEADD(day, -30, CURRENT_TIMESTAMP())
+    JOIN snowflake.account_usage.query_attribution_history qah
         ON qh.query_id = qah.query_id
-    WHERE qh.start_time >= DATEADD(day, -30, CURRENT_TIMESTAMP())
     GROUP BY ALL
 )
 SELECT
-    COALESCE(c.notebook_name, w.notebook_name) AS notebook_name,
     COALESCE(c.user_name, w.user_name) AS user_name,
     COALESCE(c.container_credits, 0) AS container_runtime_credits,
     COALESCE(w.warehouse_credits, 0) AS warehouse_pushdown_credits,
@@ -193,15 +216,15 @@ SELECT
     CASE 
         WHEN c.container_credits > 0 AND w.warehouse_credits > 0 THEN 'Hybrid (Container + Warehouse)'
         WHEN c.container_credits > 0 THEN 'Container Runtime Only'
-        ELSE 'Warehouse Runtime Only'
+        ELSE 'Warehouse Only'
     END AS runtime_type
 FROM container_costs c
 FULL OUTER JOIN warehouse_costs w
-    ON c.notebook_name = w.notebook_name AND c.user_name = w.user_name
+    ON c.user_name = w.user_name
 ORDER BY total_credits DESC;
 ```
 
-That `runtime_type` column at the end? Magic. Now you can immediately see which notebooks are running on Container Runtime (both costs), which are warehouse-only, and — most importantly — where the money's actually going.
+Both CTEs aggregate to one row per user before joining, so there's no fanout. The `runtime_type` column lets you immediately see whether a user's notebook work is container-heavy, warehouse-heavy, or both. For per-notebook-name breakdown, swap the `warehouse_costs` CTE for the tag-based query from Step 2's upgrade.
 
 ## Step 4: Enhance with Object Tagging
 
@@ -221,6 +244,12 @@ ALTER NOTEBOOK my_database.my_schema."My Notebook"
 ```
 
 Tags support [inheritance and automatic propagation](https://docs.snowflake.com/en/user-guide/object-tagging/introduction#using-tags-to-monitor-resource-usage). Apply them at the notebook level and you've got multi-dimensional cost analysis across departments, projects, and business units. Your finance team will thank you.
+
+**Heads up:** `ALTER NOTEBOOK ... SET TAG` applies to schema-level `NOTEBOOK` objects (legacy notebooks, or notebooks created as objects). Workspaces notebooks are file-based and live in your personal database, so they aren't addressable this way. For Workspaces, the session query tag from Step 2 is your attribution mechanism — encode cost center, team, or project directly in the JSON tag:
+
+```sql
+ALTER SESSION SET QUERY_TAG = '{"notebook": "q2_model_refresh", "cost_center": "data_science", "team": "recommendation_engine"}';
+```
 
 ## Step 5: Deploy the Streamlit Dashboard
 
@@ -272,12 +301,12 @@ That's it! The dashboard runs as a persistent shared server on Container Runtime
 
 Snowflake Notebook cost attribution is crystal clear when you leverage:
 
-1. **`notebooks_container_runtime_history`** for per-user container compute
-2. **`query_attribution_history`** with notebook query tags for warehouse pushdown
-3. **Object tags** for organizational cost allocation
+1. **`notebooks_container_runtime_history`** for per-user container compute (automatic)
+2. **`sessions` + `query_history` + `query_attribution_history`** to attribute warehouse pushdown to notebooks automatically — no query tag required
+3. **A manual `QUERY_TAG`** when you need per-notebook-name granularity
 4. **A Streamlit dashboard** for continuous monitoring
 
-Start with the combined SQL query in Step 3, explore your cost distribution, and when you're ready for continuous monitoring, deploy the dashboard. As the migration from Legacy Notebooks accelerates and teams lean further into Workspaces, having this visibility from day one is critical.
+Start with the combined SQL query in Step 3, explore your cost distribution, and when you're ready for continuous monitoring, deploy the dashboard. Having this visibility from day one is critical.
 
 Pat yourself on the back. You've just turned on the lights. Next time someone asks "How much is this costing us?" You are ready  💥
 
@@ -289,4 +318,3 @@ Pat yourself on the back. You've just turned on the lights. Next time someone as
 - Snowflake Docs: [NOTEBOOKS_CONTAINER_RUNTIME_HISTORY View](https://docs.snowflake.com/en/sql-reference/account-usage/notebooks_container_runtime_history)
 - Snowflake Docs: [QUERY_ATTRIBUTION_HISTORY View](https://docs.snowflake.com/en/sql-reference/account-usage/query_attribution_history)
 - Snowflake Docs: [Object Tagging Introduction](https://docs.snowflake.com/en/user-guide/object-tagging/introduction)
-- Snowflake Docs: [Migrating Legacy Notebooks to Workspaces](https://docs.snowflake.com/en/user-guide/ui-snowsight/notebooks-in-workspaces/notebooks-in-workspaces-migrate)

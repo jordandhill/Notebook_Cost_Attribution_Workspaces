@@ -18,6 +18,10 @@ CREATE TAG IF NOT EXISTS NOTEBOOK_COST_ATTRIBUTION.ANALYTICS.TEAM;
 CREATE TAG IF NOT EXISTS NOTEBOOK_COST_ATTRIBUTION.ANALYTICS.PROJECT;
 
 -- Example: Apply tags to a notebook
+-- NOTE: ALTER NOTEBOOK ... SET TAG applies to schema-level NOTEBOOK objects
+-- (legacy notebooks). Workspaces notebooks are file-based -- for those, set a
+-- session query tag in the first cell instead:
+--   ALTER SESSION SET QUERY_TAG = '{"notebook": "my_notebook", "cost_center": "data_science"}';
 -- ALTER NOTEBOOK my_database.my_schema."My Notebook"
 --     SET TAG NOTEBOOK_COST_ATTRIBUTION.ANALYTICS.COST_CENTER = 'data_science';
 

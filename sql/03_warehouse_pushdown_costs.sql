@@ -2,44 +2,57 @@
 -- Warehouse Pushdown Costs
 -- Credits consumed by SQL/Snowpark queries pushed to warehouses
 -- from notebooks running on Container Runtime
+--
+-- Notebooks in Workspaces do NOT emit query tags automatically. We
+-- identify notebook sessions via the SESSIONS view, which auto-populates
+-- CLIENT_ENVIRONMENT:APPLICATION = 'Snowflake Web App (snowsight_notebook)'.
+-- That captures both Workspaces (PythonSnowpark client) and legacy
+-- (Go client) notebooks. SESSION_ID bridges to QUERY_HISTORY, and
+-- QUERY_ID bridges to QUERY_ATTRIBUTION_HISTORY for the credits.
 -- ============================================================
 
--- Identify all notebook names from query tags
-WITH notebook_query_tags AS (
-    SELECT DISTINCT
-        PARSE_JSON(query_tag):StreamlitName::VARCHAR AS notebook_name
-    FROM snowflake.account_usage.query_history 
-    WHERE query_text ILIKE 'execute notebook%'
-      AND query_tag IS NOT NULL
-      AND start_time >= DATEADD(day, -30, CURRENT_TIMESTAMP())
-),
--- Find ALL queries associated with each notebook
-all_nb_queries AS (
-    SELECT 
-        qt.notebook_name,
-        qh.query_id,
-        qh.user_name,
-        qh.warehouse_name,
-        qh.start_time,
-        qh.end_time,
-        qh.execution_time,
-        qh.query_type
-    FROM snowflake.account_usage.query_history qh
-    JOIN notebook_query_tags qt
-    WHERE qh.query_tag ILIKE ('%' || qt.notebook_name || '%')
-      AND qh.start_time >= DATEADD(day, -30, CURRENT_TIMESTAMP())
+-- Automatic: warehouse pushdown credits per user (no query tag required)
+WITH notebook_sessions AS (
+    SELECT DISTINCT session_id, user_name
+    FROM snowflake.account_usage.sessions
+    WHERE GET_PATH(PARSE_JSON(client_environment), 'APPLICATION')::VARCHAR
+          = 'Snowflake Web App (snowsight_notebook)'
+      AND created_on >= DATEADD(day, -30, CURRENT_TIMESTAMP())
 )
--- Aggregate warehouse costs per notebook
-SELECT 
-    notebook_name,
-    COUNT(*) AS total_queries,
+SELECT
+    ns.user_name,
+    COUNT(DISTINCT qh.query_id) AS attributed_queries,
     SUM(qah.credits_attributed_compute) AS total_warehouse_credits,
-    MIN(nb.start_time) AS first_execution,
-    MAX(nb.end_time) AS last_execution,
-    ARRAY_AGG(DISTINCT nb.warehouse_name) AS warehouses_used,
-    ARRAY_AGG(DISTINCT nb.user_name) AS users
-FROM all_nb_queries nb
-LEFT JOIN snowflake.account_usage.query_attribution_history qah 
-    ON nb.query_id = qah.query_id
-GROUP BY notebook_name
+    MIN(qh.start_time) AS first_execution,
+    MAX(qh.end_time) AS last_execution,
+    ARRAY_AGG(DISTINCT qah.warehouse_name) AS warehouses_used
+FROM notebook_sessions ns
+JOIN snowflake.account_usage.query_history qh
+    ON qh.session_id = ns.session_id
+    AND qh.start_time >= DATEADD(day, -30, CURRENT_TIMESTAMP())
+JOIN snowflake.account_usage.query_attribution_history qah
+    ON qh.query_id = qah.query_id
+GROUP BY ALL
+ORDER BY total_warehouse_credits DESC;
+
+-- ============================================================
+-- Upgrade: per-notebook-name attribution
+-- The query above attributes by USER, not by notebook name (the SESSIONS
+-- view doesn't track which notebook file is open). For per-notebook
+-- breakdown, set a query tag in the first cell of each notebook:
+--
+--   ALTER SESSION SET QUERY_TAG = '{"notebook": "my_analysis_notebook"}';
+--
+-- Then query_attribution_history carries the tag directly -- no join needed.
+-- ============================================================
+SELECT
+    PARSE_JSON(query_tag):notebook::VARCHAR AS notebook_name,
+    user_name,
+    warehouse_name,
+    COUNT(*) AS attributed_queries,
+    SUM(credits_attributed_compute) AS total_warehouse_credits
+FROM snowflake.account_usage.query_attribution_history
+WHERE query_tag ILIKE '%"notebook"%'
+  AND start_time >= DATEADD(day, -30, CURRENT_TIMESTAMP())
+GROUP BY ALL
 ORDER BY total_warehouse_credits DESC;

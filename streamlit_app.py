@@ -57,10 +57,11 @@ st.divider()
 
 @st.cache_data(ttl=600)
 def get_container_runtime_costs(days):
+    # Workspaces notebooks: NOTEBOOK_NAME is NULL, so attribute per user/service.
     return run_query(f"""
         SELECT
-            notebook_name,
             user_name,
+            service_name,
             compute_pool_name,
             DATE_TRUNC('day', start_time) AS usage_date,
             SUM(credits) AS container_runtime_credits,
@@ -74,39 +75,31 @@ def get_container_runtime_costs(days):
 
 @st.cache_data(ttl=600)
 def get_warehouse_pushdown_costs(days):
+    # Identify notebook sessions automatically via the SESSIONS view
+    # (CLIENT_ENVIRONMENT:APPLICATION). Bridge SESSION_ID -> QUERY_HISTORY ->
+    # QUERY_ATTRIBUTION_HISTORY. NOTEBOOK_NAME is populated only when a query
+    # tag like {"notebook": "..."} was set in the notebook's first cell.
     return run_query(f"""
-        WITH notebook_query_tags AS (
-            SELECT DISTINCT
-                PARSE_JSON(query_tag):StreamlitName::VARCHAR AS notebook_name
-            FROM snowflake.account_usage.query_history 
-            WHERE query_text ILIKE 'execute notebook%'
-              AND query_tag IS NOT NULL
-              AND start_time >= DATEADD(day, -{days}, CURRENT_TIMESTAMP())
-        ),
-        all_nb_queries AS (
-            SELECT 
-                qt.notebook_name,
-                qh.query_id,
-                qh.user_name,
-                qh.warehouse_name,
-                qh.start_time,
-                qh.execution_time
-            FROM snowflake.account_usage.query_history qh
-            JOIN notebook_query_tags qt
-            WHERE qh.query_tag ILIKE ('%' || qt.notebook_name || '%')
-              AND qh.start_time >= DATEADD(day, -{days}, CURRENT_TIMESTAMP())
+        WITH notebook_sessions AS (
+            SELECT DISTINCT session_id, user_name
+            FROM snowflake.account_usage.sessions
+            WHERE GET_PATH(PARSE_JSON(client_environment), 'APPLICATION')::VARCHAR
+                  = 'Snowflake Web App (snowsight_notebook)'
+              AND created_on >= DATEADD(day, -{days}, CURRENT_TIMESTAMP())
         )
         SELECT
-            nb.notebook_name,
-            nb.user_name,
-            nb.warehouse_name,
-            DATE_TRUNC('day', nb.start_time) AS usage_date,
-            COUNT(*) AS query_count,
-            SUM(qah.credits_attributed_compute) AS warehouse_credits,
-            SUM(nb.execution_time) AS total_execution_time_ms
-        FROM all_nb_queries nb
-        LEFT JOIN snowflake.account_usage.query_attribution_history qah 
-            ON nb.query_id = qah.query_id
+            ns.user_name,
+            qh.warehouse_name,
+            PARSE_JSON(qh.query_tag):notebook::VARCHAR AS notebook_name,
+            DATE_TRUNC('day', qh.start_time) AS usage_date,
+            COUNT(DISTINCT qh.query_id) AS query_count,
+            SUM(qah.credits_attributed_compute) AS warehouse_credits
+        FROM notebook_sessions ns
+        JOIN snowflake.account_usage.query_history qh
+            ON qh.session_id = ns.session_id
+            AND qh.start_time >= DATEADD(day, -{days}, CURRENT_TIMESTAMP())
+        JOIN snowflake.account_usage.query_attribution_history qah
+            ON qh.query_id = qah.query_id
         GROUP BY ALL
         ORDER BY usage_date DESC
     """)
@@ -127,7 +120,7 @@ m4.metric("Container Runtime %", f"{container_pct:.1f}%")
 
 st.divider()
 
-tab1, tab2, tab3, tab4 = st.tabs(["Daily Trend", "By Notebook", "By User", "Raw Data"])
+tab1, tab2, tab3, tab4 = st.tabs(["Daily Trend", "By User", "By Notebook (tagged)", "Raw Data"])
 
 with tab1:
     st.subheader("Daily Credit Consumption")
@@ -172,39 +165,12 @@ with tab1:
         st.info("No notebook cost data found for the selected period.")
 
 with tab2:
-    st.subheader("Cost by Notebook")
-
-    notebook_costs = []
-    if not container_df.empty:
-        for name, grp in container_df.groupby("NOTEBOOK_NAME"):
-            notebook_costs.append({
-                "notebook_name": name,
-                "container_credits": float(grp["CONTAINER_RUNTIME_CREDITS"].sum()),
-                "warehouse_credits": 0.0
-            })
-    if not warehouse_df.empty:
-        for name, grp in warehouse_df.groupby("NOTEBOOK_NAME"):
-            existing = next((n for n in notebook_costs if n["notebook_name"] == name), None)
-            if existing:
-                existing["warehouse_credits"] = float(grp["WAREHOUSE_CREDITS"].sum())
-            else:
-                notebook_costs.append({
-                    "notebook_name": name,
-                    "container_credits": 0.0,
-                    "warehouse_credits": float(grp["WAREHOUSE_CREDITS"].sum())
-                })
-
-    if notebook_costs:
-        nb_df = pd.DataFrame(notebook_costs)
-        nb_df["total_credits"] = nb_df["container_credits"] + nb_df["warehouse_credits"]
-        nb_df = nb_df.sort_values("total_credits", ascending=False)
-        st.dataframe(nb_df, use_container_width=True, hide_index=True)
-        st.bar_chart(nb_df.set_index("notebook_name")[["container_credits", "warehouse_credits"]])
-    else:
-        st.info("No notebook cost data found.")
-
-with tab3:
     st.subheader("Cost by User")
+    st.caption(
+        "User is the common key across both cost dimensions. Container credits "
+        "are tracked per user (Workspaces notebooks have no notebook name), and "
+        "warehouse credits come from the notebook's session activity."
+    )
 
     user_costs = []
     if not container_df.empty:
@@ -234,6 +200,29 @@ with tab3:
         st.bar_chart(user_df.set_index("user_name")[["container_credits", "warehouse_credits"]])
     else:
         st.info("No user cost data found.")
+
+with tab3:
+    st.subheader("Cost by Notebook (tagged)")
+    st.caption(
+        "Warehouse pushdown credits broken down by notebook name. This requires "
+        "setting a query tag in the notebook's first cell, e.g. "
+        "`ALTER SESSION SET QUERY_TAG = '{\"notebook\": \"my_notebook\"}';` "
+        "Untagged notebook queries appear under '(untagged)'. Container credits "
+        "cannot be split by notebook name and are not shown here."
+    )
+
+    if not warehouse_df.empty:
+        nb = warehouse_df.copy()
+        nb["NOTEBOOK_NAME"] = nb["NOTEBOOK_NAME"].fillna("(untagged)")
+        nb_df = nb.groupby("NOTEBOOK_NAME", as_index=False).agg(
+            warehouse_credits=("WAREHOUSE_CREDITS", "sum"),
+            query_count=("QUERY_COUNT", "sum")
+        )
+        nb_df = nb_df.sort_values("warehouse_credits", ascending=False)
+        st.dataframe(nb_df, use_container_width=True, hide_index=True)
+        st.bar_chart(nb_df.set_index("NOTEBOOK_NAME")[["warehouse_credits"]])
+    else:
+        st.info("No warehouse pushdown data found.")
 
 with tab4:
     st.subheader("Raw Data Export")

@@ -10,6 +10,14 @@ Snowflake Notebooks in Workspaces introduce two billing dimensions:
 1. **Container Runtime** (SPCS compute pool) — per-user Python kernel costs, tracked via `notebooks_container_runtime_history`
 2. **Warehouse Pushdown** — SQL/Snowpark queries executed on the warehouse, tracked via `query_attribution_history`
 
+### How notebooks are identified
+
+Workspaces notebooks do **not** emit query tags automatically, and `notebooks_container_runtime_history.notebook_name` is **NULL** for them (they are file-based, not schema-level `NOTEBOOK` objects). Attribution therefore keys on **user**:
+
+- **Container side:** grouped by `user_name` / `service_name` (named `<user>_SERVICE_N`).
+- **Warehouse side:** notebook sessions are identified automatically via the `sessions` view — `CLIENT_ENVIRONMENT:APPLICATION = 'Snowflake Web App (snowsight_notebook)'` — then bridged `SESSION_ID` → `query_history` → `query_attribution_history`. No query tag required.
+- **Per-notebook-name granularity (optional):** set `ALTER SESSION SET QUERY_TAG = '{"notebook": "my_notebook"}'` in the first cell, and the tag flows through to `query_attribution_history`.
+
 ## Project Structure
 
 ```
@@ -63,16 +71,20 @@ CREATE OR REPLACE STREAMLIT MY_DB.MY_SCHEMA.NOTEBOOK_COST_DASHBOARD
 ALTER STREAMLIT MY_DB.MY_SCHEMA.NOTEBOOK_COST_DASHBOARD ADD LIVE VERSION FROM LAST;
 ```
 
-See `sql/01_setup.sql` for the full setup script including tags and optional views.
+See `sql/01_setup.sql` for the full setup script including the optional compute pool and Streamlit deployment.
+
+> Note: `ALTER NOTEBOOK ... SET TAG` object tagging applies to schema-level `NOTEBOOK` objects only. Workspaces notebooks are file-based, so use the session `QUERY_TAG` approach above for per-notebook attribution.
 
 ## Requirements
 
 Requires access to:
+- `snowflake.account_usage.sessions`
 - `snowflake.account_usage.query_history`
 - `snowflake.account_usage.query_attribution_history`
 - `snowflake.account_usage.notebooks_container_runtime_history`
 
 ## Attribution Latency
 
-- `query_attribution_history`: up to 8 hours
+- `query_attribution_history`: up to 8 hours (the binding constraint)
 - `notebooks_container_runtime_history`: up to 3 hours
+- `sessions`: up to 3 hours
