@@ -155,12 +155,60 @@ with tab1:
 
         chart_data = daily_merged.set_index("USAGE_DATE")[["container_credits", "warehouse_credits"]]
 
+        # Use a bar chart: notebook usage is sparse and per-day discrete. An
+        # area/line chart would interpolate across days with no activity and
+        # misleadingly imply continuous consumption. Container-runtime and
+        # warehouse-runtime notebooks also legitimately land on different days.
         if cost_type == "Container Runtime Only":
-            st.area_chart(chart_data[["container_credits"]])
+            st.bar_chart(chart_data[["container_credits"]])
         elif cost_type == "Warehouse Pushdown Only":
-            st.area_chart(chart_data[["warehouse_credits"]])
+            st.bar_chart(chart_data[["warehouse_credits"]])
         else:
-            st.area_chart(chart_data)
+            st.bar_chart(chart_data, stack=True)
+
+        st.caption(
+            "Bars show credits on days with activity. Days with only one cost "
+            "type are expected: warehouse-runtime notebooks have no container "
+            "component, and container-runtime notebooks with light SQL push "
+            "little or nothing to a warehouse."
+        )
+
+        st.markdown("##### Supporting Data")
+        grid = daily_merged[["USAGE_DATE", "container_credits", "warehouse_credits", "total_credits"]].copy()
+        grid["USAGE_DATE"] = pd.to_datetime(grid["USAGE_DATE"]).dt.date
+        grid = grid.sort_values("USAGE_DATE", ascending=False)
+        grid = grid.rename(columns={
+            "USAGE_DATE": "Date",
+            "container_credits": "Container Credits",
+            "warehouse_credits": "Warehouse Credits",
+            "total_credits": "Total Credits",
+        })
+
+        # Append a totals row
+        totals = pd.DataFrame([{
+            "Date": "Total",
+            "Container Credits": grid["Container Credits"].sum(),
+            "Warehouse Credits": grid["Warehouse Credits"].sum(),
+            "Total Credits": grid["Total Credits"].sum(),
+        }])
+        grid_display = pd.concat([grid.astype({"Date": "string"}), totals], ignore_index=True)
+
+        st.dataframe(
+            grid_display,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Container Credits": st.column_config.NumberColumn(format="%.4f"),
+                "Warehouse Credits": st.column_config.NumberColumn(format="%.4f"),
+                "Total Credits": st.column_config.NumberColumn(format="%.4f"),
+            },
+        )
+        st.download_button(
+            "Download daily data (CSV)",
+            grid.to_csv(index=False),
+            "daily_credit_consumption.csv",
+            "text/csv",
+        )
     else:
         st.info("No notebook cost data found for the selected period.")
 
